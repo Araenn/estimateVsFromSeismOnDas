@@ -102,6 +102,28 @@ def main():
         ax.legend(fontsize=8)
         fig.savefig(folder / f"merged_{mode}_events.png", dpi=250)
         plt.close(fig)
+
+
+    folder = Path("/home/lea/Desktop/code/resonance_model/resonance_model/picking")
+    model = pd.read_pickle(folder / "resonance_merged_events_median.pkl")
+
+    rows = []
+    for r in model.itertuples(index=False):
+        values = (r.dist_km, r.water_depth_m, r.H_median,
+                r.cs0_median, r.nu_median)
+        if not np.all(np.isfinite(values)) or r.H_median <= 0:
+            continue
+
+        for depth in np.linspace(0, r.H_median, 80):
+            rows.append({
+                "x_km": r.dist_km,
+                "z_m": -r.water_depth_m - depth,
+                "vs_mps": r.cs0_median * max(depth, 0.1) ** r.nu_median,
+            })
+
+    vs2d = pd.DataFrame(rows)
+    vs2d.to_pickle(folder / "vs_model_2d.pkl")
+    vs2d.to_csv(folder / "vs_model_2d_merged.csv", index=False)
     if PLOT_MODEL:
         channels = merged["channel"].to_numpy()
         # Match the original merged plot: evaluate Vs from the median parameters.

@@ -2,6 +2,8 @@
 
 Compute OptoDAS frequency–distance spectra, manually pick `fs1`/`fs2`, estimate a shear-wave velocity model, and merge multiple events. Based on Taweesintananon et al (Taweesintananon, Kittinat, Rørstadbotnen, Robin André, Landrø, Martin, Johansen, Ståle Emil, Arntsen, Børge, Forwick, Matthias, Hanssen, Alfred (2024) Near-surface characterization using shear-wave resonances: A case study from offshore Svalbard, Norway. GEOPHYSICS, 89 (4). doi:10.1190/geo2023-0530.1)
 
+Earthquakes times are picked based on the https://www.jordskjelv.no/ database.
+
 ## Setup
 
 Keep the scripts together, using the filenames below without download suffixes such as `(2)`.
