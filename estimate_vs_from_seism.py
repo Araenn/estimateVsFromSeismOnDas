@@ -1,443 +1,229 @@
 #!/usr/bin/env python3
-# estimate_vs_resonance_like_paper.py
+"""Calculate DAS spectra, pick fs1/fs2 and export the shear-wave velocity model."""
 
+import hashlib
+import json
 import os
-import sys
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import xarray as xr
-from scipy.signal import find_peaks
-from scipy.ndimage import gaussian_filter1d
-from pyproj import Transformer
-
-sys.path.append("/home/lea/Desktop/code/thesis/das_datas/lib/")
-import map.geo_functions as gf
 import vs_functions as func
 
 
-# ============================================================
-# PARAMS
-# ============================================================
+# =========================== PARAMETERS ============================
+SAVE_DIR = "/home/lea/Desktop/code/resonance_model/resonance_model/picking"
+DAS_FOLDER = "/media/lea/Expansion/DAS/20250815/dphi"
+EVENT_ID = "1508"                    # change for 1208 and 1508
+T_START = [4, 54, 42] # 16
+T_END = [5, 4, 42]
+T_START = [14, 0, 42] # 15
+T_END = [14, 15, 42]
+""" T_START = [17, 18, 42] # 12
+T_END = [17, 28, 42] """
+CHAN_START, CHAN_END = 0, 5001
+DX = 4.08
+FS_IN, FS_OUT = 2000, 40
+FMIN, FMAX = 0.3, 19.0              # unchanged calculation band
+NPERSEG_S, NOVERLAP_S = 60, 30
+CHUNK_CHANNELS = 100
+WELCH_AVERAGE = "mean"
 
-SAVE_DIR = "/home/lea/Desktop/code/thesis/das_datas/resonance_model"
-os.makedirs(SAVE_DIR, exist_ok=True)
+NORMALIZE_BAND = (0.5, 9.0)
+PREVIEW_BAND = (0.5, 9.0)
+FS1_PICK_BAND = (0.5, 4.0)          # display bands; no model constraint is imposed
+FS2_PICK_BAND = (2.0, 9.0)
+SPATIAL_SIGMA_CHANNELS = 3.0         # 12.24 m standard deviation; approximately 29 m FWHM
+FREQ_SIGMA_HZ = 0.0                 # no frequency smoothing
+COLOR_PERCENTILES = (5, 95)
+SEGMENT_CHANNELS = 1000
+MAX_INTERP_GAP_CHANNELS = 500        # retain NaN across long gaps
 
+REUSE_CACHE = True                  # reuse PSDs when calculation settings match
+REUSE_PICKS = True                  # reload existing picks for editing
+DO_MANUAL_PICKING = True            # False: export previously saved picks without editing
+SHOW_PREVIEW = True                 # close the preview to start picking
+BUILD_MODEL = True                  # False: run spectrum calculation and picking only
+PLOT_MODEL = True                   # export the Vs section and model parameters
+SHOW_MODEL = True                   # display model figures after exporting them
+MODEL_DEPTH_MAX_M = None            # None: use the largest valid layer thickness
+MODEL_DEPTH_SAMPLES = 300
+MODEL_REVERSE_DISTANCE = True       # original orientation: higher distances on the left
+MODEL_VS_LIMITS = (0, 600)           # original color scale; does not clip model values
+CS_AVG = 200.0                      # same assumption as in the original script
 BATHY_PATH = "/home/lea/Desktop/code/thesis/das_datas/bathy_svalbard_subset.nc"
 CABLE_CSV = "/home/lea/Desktop/code/thesis/das_datas/map/outer_cable_positions.csv"
-
-DAS_FOLDER = "/media/lea/Expansion/DAS/20250816/dphi"
-
-DX = 4.08
-CHAN_START = 0
-CHAN_END = 5001
-
-FS_IN = 2000
-FS_OUT = 40
-
-FMIN = 0.3
-FMAX = 19.0
-
-# fenêtre temporelle type événement
-T_START = [4,54,42]
-T_END = [5,4,42]
-
-# hypothèse case 1 du papier
-CS_AVG = 200.0  # m/s
-
-# picking
-SMOOTH_FREQ_SIGMA = 1.0
-MIN_PEAK_PROMINENCE = 0.08
-MIN_PEAK_DISTANCE_HZ = 0.4
-
-# ============================================================
-# LOAD BATHY ALONG CABLE
-# ============================================================
-
-ds = xr.open_dataset(BATHY_PATH)
-bathy = ds["z"]
-
-Lat, Lon, new_Lat, new_Lon = gf.create_cable_map(
-    CABLE_CSV,
-    CHAN_END + 1,
-    1.02 * 4,
-    start_offset_m=0,
-)
-
-transformer_bathy = Transformer.from_crs("EPSG:4326", "EPSG:3996", always_xy=True)
-
-cable_lon = np.asarray(new_Lon)
-cable_lat = np.asarray(new_Lat)
-
-cable_x, cable_y = transformer_bathy.transform(cable_lon, cable_lat)
-
-bathy_on_cable = bathy.interp(
-    x=xr.DataArray(cable_x, dims="channel"),
-    y=xr.DataArray(cable_y, dims="channel"),
-)
-
-bathy_values = bathy_on_cable.values
-dist_bathy = np.arange(len(bathy_values)) * DX
-
-
-# ============================================================
-# COMPUTE F-X POWER SPECTRUM
-# ============================================================
-
-""" res_fx = func.das_fx_spectrum_chunked(
-    t_start=T_START,
-    t_end=T_END,
-    path_folder=DAS_FOLDER,
-    chan_start_idx=CHAN_START,
-    chan_end_idx=CHAN_END,
-    chunk_channels=100,
-    fs_in=FS_IN,
-    fs_out=FS_OUT,
-    fmin=FMIN,
-    fmax=FMAX,
-    nperseg_s=60,
-    noverlap_s=30,
-    remove_common=False,
-    robust_normalize=True,
-    plot=True,
-)
-
-f, dist_m, Z = func.extract_fx_arrays(res_fx)
-
-# Z attendu : shape = [n_freq, n_x] ou [n_x, n_freq]
-if Z.shape[0] != len(f):
-    Z = Z.T
-
-# conversion en amplitude normalisée
-Z = np.asarray(Z, dtype=float)
-Z = np.nan_to_num(Z, nan=np.nanmedian(Z))
-
-from scipy.ndimage import gaussian_filter
-
-Z = gaussian_filter(Z, sigma=(1.0, 20.0))  # freq, espace
-
-
-# ============================================================
-# PICK fs1 / fs2 ALONG CABLE
-# ============================================================
-x_chan = dist_m / DX
-
-rows = []
-# Pick manuel fs1
-x_fs1, f_fs1 = func.manual_pick_curve(
-    Z, f, x_chan,
-    title="Manual picking fs1 - click along first resonance"
-)
-
-# Pick manuel fs2
-x_fs2, f_fs2 = func.manual_pick_curve(
-    Z, f, x_chan,
-    title="Manual picking fs2 - click along second resonance"
-)
-
-fs1_manual = func.interpolate_manual_picks(
-    x_fs1,
-    f_fs1,
-    x_chan,
-    sigma_pts=15
-)
-
-fs2_manual = func.interpolate_manual_picks(
-    x_fs2,
-    f_fs2,
-    x_chan,
-    sigma_pts=15
-)
-
-plt.figure(figsize=(15, 6))
-
-plt.imshow(
-    Z,
-    aspect="auto",
-    origin="lower",
-    extent=[x_chan[0], x_chan[-1], f[0], f[-1]]
-)
-
-plt.colorbar(label="Relative PSD used for picking")
-plt.xlabel("DAS channel index")
-plt.ylabel("Frequency [Hz]")
-plt.title("Manual resonance picking")
-
-plt.plot(x_fs1, f_fs1, "o", ms=4, label="fs1 manual points")
-plt.plot(x_fs2, f_fs2, "o", ms=4, label="fs2 manual points")
-
-plt.plot(x_chan, fs1_manual, lw=2, label="fs1 interpolated")
-plt.plot(x_chan, fs2_manual, lw=2, label="fs2 interpolated")
-
-plt.grid()
-plt.legend()
-plt.tight_layout()
-plt.savefig(os.path.join(SAVE_DIR, "manual_resonance_picks_1608.png"), dpi=300)
-plt.show()
-
-# ============================================================
-# BUILD df_res_raw FROM MANUAL PICKS
-# ============================================================
-
-rows = []
-
-for ix, x in enumerate(dist_m):
-
-    fs1 = fs1_manual[ix]
-    fs2 = fs2_manual[ix]
-
-    model = func.compute_resonance_model(
-        fs1,
-        fs2,
-        H=None,          # Case 1 : comme papier sans sismique
-        cs_avg=CS_AVG,
-    )
-
-    if model is None:
-        continue
-
-    water_depth = -np.interp(x, dist_bathy, bathy_values)
-
-    rows.append({
-        "dist_m": x,
-        "dist_km": x / 1000,
-        "water_depth_m": water_depth,
-        "fs1": fs1,
-        "fs2": fs2,
-        **model,
-    })
-
-np.savez(
-    os.path.join(SAVE_DIR, "manual_resonance_picks_points_1608.npz"),
-    x_fs1=x_fs1,
-    f_fs1=f_fs1,
-    x_fs2=x_fs2,
-    f_fs2=f_fs2,
-) """
-
-""" manual = np.load(os.path.join(SAVE_DIR, "manual_resonance_picks_points.npz"))
-
-x_fs1 = manual["x_fs1"]
-f_fs1 = manual["f_fs1"]
-x_fs2 = manual["x_fs2"]
-f_fs2 = manual["f_fs2"] """
-
-""" df_res_raw = pd.DataFrame(rows)
-df_res_raw = df_res_raw.sort_values("dist_m").reset_index(drop=True)
-
-
-# sauvegarde brut
-df_res_raw.to_csv(os.path.join(SAVE_DIR, "resonance_picks_model_case1_raw_1608.csv"), index=False)
-df_res_raw.to_pickle(os.path.join(SAVE_DIR, "resonance_picks_model_case1_raw_1608.pkl"))
-
-df_res_raw = pd.read_pickle(os.path.join(SAVE_DIR, "resonance_picks_model_case1_raw_1608.pkl")) """
-df_res_raw = pd.read_pickle(os.path.join(SAVE_DIR, "resonance_merged_events_median.pkl"))
-
-# grille régulière
-dx_interp = 4.08
-x_grid = np.arange(
-    df_res_raw["dist_m"].min(),
-    df_res_raw["dist_m"].max() + dx_interp,
-    dx_interp
-)
-
-df_grid = pd.DataFrame({"dist_m": x_grid})
-df_grid["dist_km"] = df_grid["dist_m"] / 1000
-
-for col in ["fs1_median", "fs2_median", "water_depth_m"]:
-    df_grid[col] = np.interp(
-        x_grid,
-        df_res_raw["dist_m"].values,
-        df_res_raw[col].values
-    )
-
-# lissage spatial des fréquences, pas de H
-sigma_m = 50
-sigma_pts = sigma_m / dx_interp
-
-df_grid["fs1_smooth"] = gaussian_filter1d(df_grid["fs1_median"], sigma_pts)
-df_grid["fs2_smooth"] = gaussian_filter1d(df_grid["fs2_median"], sigma_pts)
-
-# recalcul du modèle depuis fs1/fs2 lissés
-rows_filled = []
-
-for _, row in df_grid.iterrows():
-
-    model = func.compute_resonance_model(
-        row["fs1_smooth"],
-        row["fs2_smooth"],
-        H=None,
-        cs_avg=CS_AVG,
-    )
-
-    if model is None:
-        continue
-
-    rows_filled.append({
-        "dist_m": row["dist_m"],
-        "dist_km": row["dist_km"],
-        "water_depth_m": row["water_depth_m"],
-        **model,
-    })
-
-df_res = pd.DataFrame(rows_filled)
-df_res = df_res.sort_values("dist_m").reset_index(drop=True)
-
-# sauvegarde final
-df_res.to_csv(os.path.join(SAVE_DIR, "resonance_picks_model_case1_1608.csv"), index=False)
-df_res.to_pickle(os.path.join(SAVE_DIR, "resonance_picks_model_case1_1608.pkl"))
-df_res = pd.read_pickle(os.path.join(SAVE_DIR, "resonance_merged_events_median.pkl"))
-
-print(df_res.head())
-print(df_res.describe())
-
-
-# ============================================================
-# BUILD 2D MODEL FOR PLOT
-# ============================================================
-
-z_rel = np.linspace(0, np.nanmax(df_res["H_median"]) * 1.05, 80)
-
-X = []
-Zabs = []
-VS = []
-
-for _, row in df_res.iterrows():
-
-    x = row["dist_m"]
-    seafloor = np.interp(x, dist_bathy, bathy_values)
-
-    H = row["H_median"]
-    cs0 = row["cs0_median"]
-    nu = row["nu_median"]
-
-    z_valid = z_rel[z_rel <= H]
-
-    vs = func.vs_power_law(z_valid, cs0, nu)
-    z_abs = seafloor - z_valid
-
-    X.extend([x / 1000] * len(z_valid))
-    Zabs.extend(z_abs)
-    VS.extend(vs)
-
-X = np.asarray(X)
-Zabs = np.asarray(Zabs)
-VS = np.asarray(VS)
-
-df_vs_2d = pd.DataFrame({
-    "x_km": X,
-    "z_m": Zabs,
-    "vs_mps": VS,
-})
-
-df_vs_2d.to_csv(
-    os.path.join(SAVE_DIR, "vs_model_2d_merged.csv"),
-    index=False
-)
-
-df_vs_2d.to_pickle(
-    os.path.join(SAVE_DIR, "vs_model_2d_merged.pkl")
-)
-# ============================================================
-# PLOT RESULT
-# ============================================================
-
-fig, ax = plt.subplots(figsize=(15, 6))
-
-sc = ax.scatter(
-    X,
-    Zabs,
-    c=VS,
-    s=10,
-    cmap="turbo",
-    vmin=0,
-    vmax=600,
-)
-
-ax.plot(
-    dist_bathy / 1000,
-    bathy_values,
-    color="k",
-    lw=2,
-    label="Bathymetry"
-)
-
-# LVL base
-base_x = df_res["dist_m"].values / 1000
-base_z = np.interp(df_res["dist_m"].values, dist_bathy, bathy_values) - df_res["H_median"].values
-
-ax.plot(
-    base_x,
-    base_z,
-    color="k",
-    lw=2,
-    ls="--",
-    label="Estimated LVL base"
-)
-
-ax.set_xlabel("Distance along cable [km]")
-ax.set_ylabel("Elevation [m]")
-ax.set_title("S-wave resonance model - Taweesintananon-style case 1")
-ax.grid(True)
-ax.legend()
-ax.invert_xaxis()
-
-cbar = plt.colorbar(sc, ax=ax)
-cbar.set_label("Estimated Vs [m/s]")
-
-plt.tight_layout()
-plt.savefig(os.path.join(SAVE_DIR, "resonance_model_case1_merged.png"), dpi=300)
-plt.show()
-
-
-# ============================================================
-# PLOT fs1 / fs2
-# ============================================================
-
-""" x_chan = dist_m / DX
-
-plt.figure(figsize=(14, 5))
-
-plt.imshow(
-    Z,
-    aspect="auto",
-    origin="lower",
-    extent=[x_chan[0], x_chan[-1], f[0], f[-1]]
-)
-
-plt.colorbar(label="Relative PSD used for picking")
-plt.xlabel("DAS channel index")
-plt.ylabel("Frequency [Hz]")
-plt.title("DAS f-x spectrum used for picking")
-
-plt.plot(df_res["dist_m"] / DX, df_res["fs1_median"], label="fs1")
-plt.plot(df_res["dist_m"] / DX, df_res["fs2_median"], label="fs2")
-
-plt.grid()
-plt.legend()
-plt.tight_layout()
-plt.savefig(os.path.join(SAVE_DIR, "picked_resonance_frequencies_on_Z_merged.png"), dpi=300)
-plt.show()
-
-plt.figure(figsize=(14, 5))
-
-plt.imshow(
-    Z,
-    aspect="auto",
-    origin="lower",
-    extent=[x_chan[0], x_chan[-1], f[0], f[-1]]
-)
-
-plt.colorbar(label="Relative PSD used for picking")
-plt.xlabel("DAS channel index")
-plt.ylabel("Frequency [Hz]")
-plt.title("Raw picks before interpolation/smoothing")
-
-plt.plot(df_res_raw["dist_m"] / DX, df_res_raw["fs1_median"], ".", ms=2, label="fs1 raw")
-plt.plot(df_res_raw["dist_m"] / DX, df_res_raw["fs2_median"], ".", ms=2, label="fs2 raw")
-
-plt.grid()
-plt.legend()
-plt.tight_layout()
-plt.savefig(os.path.join(SAVE_DIR, "raw_resonance_picks_on_Z_merged.png"), dpi=300)
-plt.show() """
+# ==================================================================
+
+
+def atomic_npz(path, **arrays):
+    tmp = Path(str(path) + ".tmp")
+    with tmp.open("wb") as stream:
+        np.savez_compressed(stream, **arrays)
+    os.replace(tmp, path)
+
+
+def calculation_signature():
+    config = dict(version=2, event_id=EVENT_ID, path_folder=DAS_FOLDER,
+                  t_start=T_START, t_end=T_END, chan_start=CHAN_START,
+                  chan_end=CHAN_END, dx=DX, fs_in=FS_IN, fs_out=FS_OUT,
+                  fmin=FMIN, fmax=FMAX, nperseg_s=NPERSEG_S,
+                  noverlap_s=NOVERLAP_S, average=WELCH_AVERAGE)
+    encoded = json.dumps(config, sort_keys=True)
+    return config, hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def load_or_compute_psd(out_dir, signature):
+    cache = out_dir / f"das_fx_psd_{EVENT_ID}.npz"
+    if REUSE_CACHE and cache.exists():
+        with np.load(cache, allow_pickle=False) as saved:
+            if str(saved["signature"].item()) == signature:
+                print(f"Loaded cached PSD: {cache}")
+                return {key: saved[key].copy() for key in saved.files
+                        if key != "signature"}
+        print("Calculation settings changed: recomputing PSDs.")
+    res = func.das_fx_spectrum_chunked(
+        t_start=T_START, t_end=T_END, path_folder=DAS_FOLDER,
+        chan_start_idx=CHAN_START, chan_end_idx=CHAN_END,
+        chunk_channels=CHUNK_CHANNELS, fs_in=FS_IN, fs_out=FS_OUT,
+        fmin=FMIN, fmax=FMAX, nperseg_s=NPERSEG_S,
+        noverlap_s=NOVERLAP_S, average=WELCH_AVERAGE)
+    atomic_npz(cache, signature=signature, **res)
+    return res
+
+
+def load_bathymetry(dist_m):
+    # Bathymetry dependencies are required only when BUILD_MODEL=True.
+    import xarray as xr
+    from pyproj import Transformer
+    import geo_functions as gf
+    with xr.open_dataset(BATHY_PATH) as ds:
+        _, _, cable_lat, cable_lon = gf.create_cable_map(
+            CABLE_CSV, CHAN_END + 1, DX, start_offset_m=0)
+        transform = Transformer.from_crs("EPSG:4326", "EPSG:3996", always_xy=True)
+        cable_x, cable_y = transform.transform(cable_lon, cable_lat)
+        bathy_values = ds["z"].interp(
+            x=xr.DataArray(cable_x, dims="channel"),
+            y=xr.DataArray(cable_y, dims="channel")).values
+    return -np.interp(dist_m, np.arange(len(bathy_values)) * DX, bathy_values)
+
+
+def main():
+    out = Path(SAVE_DIR)
+    out.mkdir(parents=True, exist_ok=True)
+    config, signature = calculation_signature()
+    # Check existing picks BEFORE starting a potentially long calculation.
+    picks_path = out / f"manual_resonance_picks_points_{EVENT_ID}.npz"
+    picks = {name: np.array([], dtype=float)
+             for name in ("x_fs1", "f_fs1", "x_fs2", "f_fs2")}
+    if REUSE_PICKS and picks_path.exists():
+        with np.load(picks_path, allow_pickle=False) as saved:
+            if str(saved["signature"].item()) != signature:
+                raise ValueError("Existing picks belong to a different calculation configuration. "
+                                 "Change EVENT_ID/SAVE_DIR or set REUSE_PICKS=False.")
+            for name in picks:
+                picks[name] = saved[name].copy()
+    if not DO_MANUAL_PICKING and not any(len(picks[name]) for name in picks):
+        raise ValueError("No saved picks to export: enable DO_MANUAL_PICKING.")
+    settings = dict(config, normalize_band=NORMALIZE_BAND,
+                    preview_band=PREVIEW_BAND, fs1_band=FS1_PICK_BAND,
+                    fs2_band=FS2_PICK_BAND, spatial_sigma_channels=SPATIAL_SIGMA_CHANNELS,
+                    freq_sigma_hz=FREQ_SIGMA_HZ, color_percentiles=COLOR_PERCENTILES,
+                    segment_channels=SEGMENT_CHANNELS,
+                    max_interp_gap_channels=MAX_INTERP_GAP_CHANNELS,
+                    cs_avg_assumed=CS_AVG, build_model=BUILD_MODEL,
+                    plot_model=PLOT_MODEL, model_depth_max_m=MODEL_DEPTH_MAX_M,
+                    model_depth_samples=MODEL_DEPTH_SAMPLES,
+                    model_reverse_distance=MODEL_REVERSE_DISTANCE,
+                    model_vs_limits=MODEL_VS_LIMITS)
+    (out / f"settings_{EVENT_ID}.json").write_text(
+        json.dumps(settings, indent=2), encoding="utf-8")
+    res = load_or_compute_psd(out, signature)
+    f, dist_m, Z_db = func.extract_fx_arrays(res, dx=DX)
+    x_chan = np.asarray(res["chx"], dtype=float)
+    raw, smooth = func.prepare_display(
+        Z_db, f, NORMALIZE_BAND, SPATIAL_SIGMA_CHANNELS, FREQ_SIGMA_HZ)
+    print(f"Frequency spacing: {np.median(np.diff(f)):.5f} Hz; "
+          f"loaded duration: {float(res['duration_s']):.1f} s")
+    print("The cache stores PSDs before normalization and smoothing.")
+    preview = func.plot_comparison(
+        raw, smooth, f, x_chan, PREVIEW_BAND, COLOR_PERCENTILES,
+        title=f"Event {EVENT_ID} | spatial sigma = {SPATIAL_SIGMA_CHANNELS * DX:.2f} m",
+        save_path=out / f"fx_comparison_{EVENT_ID}.png")
+    if SHOW_PREVIEW:
+        print("Close the comparison figure to continue.")
+        plt.show()
+    plt.close(preview)
+
+    def save_picks(mode, px, pf):
+        picks[f"x_{mode}"] = np.asarray(px)
+        picks[f"f_{mode}"] = np.asarray(pf)
+        atomic_npz(picks_path, signature=signature, **picks)
+
+    if DO_MANUAL_PICKING:
+        for mode, band in (("fs1", FS1_PICK_BAND), ("fs2", FS2_PICK_BAND)):
+            px, pf = func.manual_pick_curve(
+                raw, smooth, f, x_chan, title=f"{EVENT_ID} / {mode}", band=band,
+                segment_channels=SEGMENT_CHANNELS, percentiles=COLOR_PERCENTILES,
+                initial_picks=(picks[f"x_{mode}"], picks[f"f_{mode}"]),
+                on_update=lambda px, pf, mode=mode: save_picks(mode, px, pf))
+            save_picks(mode, px, pf)
+    fs1 = func.interpolate_manual_picks(
+        picks["x_fs1"], picks["f_fs1"], x_chan, MAX_INTERP_GAP_CHANNELS)
+    fs2 = func.interpolate_manual_picks(
+        picks["x_fs2"], picks["f_fs2"], x_chan, MAX_INTERP_GAP_CHANNELS)
+    df = pd.DataFrame(dict(channel=x_chan, dist_m=dist_m, dist_km=dist_m / 1000,
+                           fs1=fs1, fs2=fs2))
+    df["valid_pair"] = np.isfinite(fs1) & np.isfinite(fs2) & (fs2 > fs1)
+    df.to_csv(out / f"resonance_frequencies_{EVENT_ID}.csv", index=False)
+
+    fig = func.plot_comparison(raw, smooth, f, x_chan, PREVIEW_BAND,
+                               COLOR_PERCENTILES, title=f"Picks {EVENT_ID}")
+    for ax in fig.axes[:2]:
+        ax.plot(x_chan, fs1, color="white", lw=0.8, label="fs1 interpolated")
+        ax.plot(x_chan, fs2, color="tab:orange", lw=0.8, label="fs2 interpolated")
+        ax.plot(picks["x_fs1"], picks["f_fs1"], "o", color="white", mec="black", ms=3)
+        ax.plot(picks["x_fs2"], picks["f_fs2"], "o", color="tab:orange", mec="black", ms=3)
+        ax.legend(loc="upper left", fontsize=8)
+    fig.savefig(out / f"manual_resonance_picks_{EVENT_ID}.png", dpi=250)
+    plt.close(fig)
+
+    if BUILD_MODEL:
+        water_depth = load_bathymetry(dist_m)
+        rows = []
+        for i, (f1, f2) in enumerate(zip(fs1, fs2)):
+            model = func.compute_resonance_model(f1, f2, H=None, cs_avg=CS_AVG)
+            if model is not None:
+                rows.append(dict(dist_m=dist_m[i], dist_km=dist_m[i] / 1000,
+                                 water_depth_m=water_depth[i], **model))
+        columns = ["dist_m", "dist_km", "water_depth_m", "fs1", "fs2", "nu",
+                   "cs0", "H", "cs_avg_model", "cs_avg_assumed"]
+        df_model = pd.DataFrame(rows, columns=columns)
+        # Filenames remain compatible with the merge script.
+        base = out / f"resonance_picks_model_case1_{EVENT_ID}"
+        df_model.to_csv(str(base) + ".csv", index=False)
+        df_model.to_pickle(str(base) + ".pkl")
+        print(f"Exported model: {len(df_model)} / {len(x_chan)} valid channels.")
+        if PLOT_MODEL:
+            aligned = df_model.set_index("dist_m").reindex(dist_m)
+            figures = func.plot_resonance_model(
+                dist_m, aligned["cs0"], aligned["nu"], aligned["H"], dx=DX,
+                title=f"Event {EVENT_ID} | Vs model",
+                depth_max_m=MODEL_DEPTH_MAX_M, depth_samples=MODEL_DEPTH_SAMPLES,
+                water_depth_m=water_depth, reverse_distance=MODEL_REVERSE_DISTANCE,
+                vs_limits=MODEL_VS_LIMITS)
+            if figures is not None:
+                for figure, suffix in zip(figures, ("vs_model", "vs_model_parameters")):
+                    figure.savefig(out / f"{suffix}_{EVENT_ID}.png", dpi=250)
+                if SHOW_MODEL:
+                    plt.show()
+                for figure in figures:
+                    plt.close(figure)
+    print(f"Done. Output directory: {out}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except func.PickingInterrupted as exc:
+        print(exc)

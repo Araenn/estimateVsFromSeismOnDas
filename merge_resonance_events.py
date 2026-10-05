@@ -1,212 +1,126 @@
-import os
+#!/usr/bin/env python3
+"""Merge trials on their common channels without filling long gaps.
+
+Frequencies are read from picking CSVs. Physical parameters are read
+from the same event PKL when BUILD_MODEL was enabled. Output filenames
+remain compatible with the original plotting scripts.
+"""
+
+from pathlib import Path
+import json
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from estimate_vs_from_seism import (SAVE_DIR, DX, PLOT_MODEL, SHOW_MODEL,
+                                   MODEL_DEPTH_MAX_M, MODEL_DEPTH_SAMPLES,
+                                   MODEL_REVERSE_DISTANCE, MODEL_VS_LIMITS)
+import vs_functions as func
 
-SAVE_DIR = "/home/lea/Desktop/code/thesis/das_datas/resonance_model"
-DX = 4.08
+EVENT_IDS = ["1208", "1508", "1608"]
 
-event_ids = ["1208", "1508", "1608"]
 
-dfs = []
+def merge_events(folder, event_ids, dx=4.08):
+    folder = Path(folder)
+    events = []
+    for event_id in event_ids:
+        path = folder / f"resonance_frequencies_{event_id}.csv"
+        if not path.exists():
+            print(f"{event_id}: no frequency CSV available; skipping.")
+            continue
+        df = pd.read_csv(path)
+        df["channel"] = df["channel"].round().astype(int)
+        if df["channel"].duplicated().any():
+            raise ValueError(f"Duplicate channels for {event_id}.")
+        if not np.allclose(df["dist_m"], df["channel"] * dx):
+            raise ValueError(f"Channel spacing DX does not match event {event_id}.")
+        df = df.set_index("channel")
+        # Do not bridge model-rejected regions using np.interp.
+        model_path = folder / f"resonance_picks_model_case1_{event_id}.pkl"
+        model_cols = ["water_depth_m", "H", "cs0", "nu"]
+        for col in model_cols:
+            df[col] = np.nan
+        settings_path = folder / f"settings_{event_id}.json"
+        use_model = True
+        if settings_path.exists():
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            use_model = settings.get("build_model", True)
+        if use_model and model_path.exists():
+            model = pd.read_pickle(model_path)
+            model["channel"] = np.rint(model["dist_m"] / dx).astype(int)
+            model = model.set_index("channel")
+            aligned = model.reindex(df.index)
+            agrees = (np.isclose(df["fs1"], aligned["fs1"], rtol=1e-8, atol=1e-8)
+                      & np.isclose(df["fs2"], aligned["fs2"], rtol=1e-8, atol=1e-8))
+            for col in model_cols:
+                df[col] = aligned[col].where(agrees)
+        df["event_id"] = event_id
+        df["valid_fs1"] = np.isfinite(df["fs1"])
+        df["valid_fs2"] = np.isfinite(df["fs2"])
+        df["valid_model"] = np.isfinite(df["H"])
+        events.append(df)
+    if not events:
+        raise FileNotFoundError("No frequency CSVs found in SAVE_DIR.")
+    lo = max(df.index.min() for df in events)
+    hi = min(df.index.max() for df in events)
+    if hi < lo:
+        raise ValueError("The events have no channels in common.")
+    all_events = pd.concat([df.loc[(df.index >= lo) & (df.index <= hi)]
+                            for df in events]).reset_index()
+    aggregations = dict(water_depth_m=("water_depth_m", "median"),
+                        n_events=("valid_model", "sum"),
+                        n_events_fs1=("valid_fs1", "sum"),
+                        n_events_fs2=("valid_fs2", "sum"))
+    for col in ("fs1", "fs2", "H", "cs0", "nu"):
+        aggregations[f"{col}_median"] = (col, "median")
+        aggregations[f"{col}_std"] = (col, "std")
+        if col in ("fs1", "fs2", "H"):
+            aggregations[f"{col}_mean"] = (col, "mean")
+    merged = all_events.groupby("channel").agg(**aggregations).reset_index()
+    merged["dist_m"] = merged["channel"] * dx
+    merged["dist_km"] = merged["dist_m"] / 1000
+    merged["fs2_fs1_ratio"] = merged["fs2_median"] / merged["fs1_median"]
+    return all_events, merged
 
-for event_id in event_ids:
-    path = os.path.join(
-        SAVE_DIR,
-        f"resonance_picks_model_case1_{event_id}.pkl"
-    )
 
-    df = pd.read_pickle(path)
-    df["event_id"] = event_id
-    dfs.append(df)
+def main():
+    folder = Path(SAVE_DIR)
+    all_events, merged = merge_events(folder, EVENT_IDS, DX)
+    all_events.to_csv(folder / "resonance_all_events_interpolated.csv", index=False)
+    merged.to_csv(folder / "resonance_merged_events_median.csv", index=False)
+    merged.to_pickle(folder / "resonance_merged_events_median.pkl")
+    for mode in ("fs1", "fs2"):
+        fig, ax = plt.subplots(figsize=(15, 5), constrained_layout=True)
+        for event_id, df in all_events.groupby("event_id"):
+            ax.plot(df["channel"], df[mode], lw=0.8, alpha=0.6, label=event_id)
+        ax.plot(merged["channel"], merged[f"{mode}_median"], "k", lw=1.5,
+                label="Median")
+        # Standard deviation across events, not the uncertainty of individual clicks.
+        center, std = merged[f"{mode}_median"], merged[f"{mode}_std"]
+        ax.fill_between(merged["channel"], center - std, center + std,
+                        color="0.5", alpha=0.2, label="± standard deviation across events")
+        ax.set(xlabel="DAS channel", ylabel="Frequency [Hz]", title=mode)
+        ax.legend(fontsize=8)
+        fig.savefig(folder / f"merged_{mode}_events.png", dpi=250)
+        plt.close(fig)
+    if PLOT_MODEL:
+        channels = merged["channel"].to_numpy()
+        # Match the original merged plot: evaluate Vs from the median parameters.
+        parameters = [merged[f"{name}_median"].to_numpy() for name in ("cs0", "nu", "H")]
+        figures = func.plot_resonance_model(
+            channels * DX, *parameters, dx=DX,
+            title="Merged events | Vs model from median parameters",
+            depth_max_m=MODEL_DEPTH_MAX_M, depth_samples=MODEL_DEPTH_SAMPLES,
+            water_depth_m=merged["water_depth_m"].to_numpy(),
+            reverse_distance=MODEL_REVERSE_DISTANCE, vs_limits=MODEL_VS_LIMITS)
+        if figures is not None:
+            for figure, suffix in zip(figures, ("vs_model", "vs_model_parameters")):
+                figure.savefig(folder / f"merged_{suffix}.png", dpi=250)
+            if SHOW_MODEL:
+                plt.show()
+            for figure in figures:
+                plt.close(figure)
+    print(f"Merged results exported to {folder}")
 
-df_all = pd.concat(dfs, ignore_index=True)
 
-dx_interp = DX
-
-x_min = max(df.groupby("event_id")["dist_m"].min())
-x_max = min(df.groupby("event_id")["dist_m"].max())
-
-x_grid = np.arange(x_min, x_max + dx_interp, dx_interp)
-
-rows = []
-
-for event_id, df_ev in df_all.groupby("event_id"):
-
-    df_ev = df_ev.sort_values("dist_m")
-
-    out = pd.DataFrame({
-        "event_id": event_id,
-        "dist_m": x_grid,
-        "dist_km": x_grid / 1000,
-    })
-
-    for col in ["fs1", "fs2", "water_depth_m", "H", "cs0", "nu"]:
-        if col in df_ev.columns:
-            out[col] = np.interp(
-                x_grid,
-                df_ev["dist_m"].values,
-                df_ev[col].values
-            )
-
-    rows.append(out)
-
-df_grid_all = pd.concat(rows, ignore_index=True)
-
-df_merged = (
-    df_grid_all
-    .groupby("dist_m")
-    .agg(
-        dist_km=("dist_km", "first"),
-        water_depth_m=("water_depth_m", "median"),
-
-        fs1_median=("fs1", "median"),
-        fs1_mean=("fs1", "mean"),
-        fs1_std=("fs1", "std"),
-
-        fs2_median=("fs2", "median"),
-        fs2_mean=("fs2", "mean"),
-        fs2_std=("fs2", "std"),
-
-        H_median=("H", "median"),
-        H_mean=("H", "mean"),
-        H_std=("H", "std"),
-
-        cs0_median=("cs0", "median"),
-        cs0_std=("cs0", "std"),
-
-        nu_median=("nu", "median"),
-        nu_std=("nu", "std"),
-
-        n_events=("event_id", "nunique"),
-    )
-    .reset_index()
-)
-
-df_merged["fs2_fs1_ratio"] = (
-    df_merged["fs2_median"] / df_merged["fs1_median"]
-)
-
-df_grid_all.to_csv(
-    os.path.join(SAVE_DIR, "resonance_all_events_interpolated.csv"),
-    index=False
-)
-
-df_merged.to_csv(
-    os.path.join(SAVE_DIR, "resonance_merged_events_median.csv"),
-    index=False
-)
-
-df_merged.to_pickle(
-    os.path.join(SAVE_DIR, "resonance_merged_events_median.pkl")
-)
-
-x_chan = df_merged["dist_m"] / DX
-
-plt.figure(figsize=(15, 5))
-
-for event_id, df_ev in df_grid_all.groupby("event_id"):
-    plt.plot(
-        df_ev["dist_m"] / DX,
-        df_ev["fs1"],
-        lw=1,
-        alpha=0.4,
-        label=f"fs1 {event_id}"
-    )
-
-plt.plot(
-    x_chan,
-    df_merged["fs1_median"],
-    "k",
-    lw=2.5,
-    label="fs1 median"
-)
-
-plt.fill_between(
-    x_chan,
-    df_merged["fs1_median"] - df_merged["fs1_std"],
-    df_merged["fs1_median"] + df_merged["fs1_std"],
-    alpha=0.2,
-    label="fs1 ± std"
-)
-
-plt.xlabel("DAS channel index")
-plt.ylabel("Frequency [Hz]")
-plt.title("Merged fs1 from multiple earthquakes")
-plt.grid()
-plt.legend()
-plt.tight_layout()
-plt.savefig(os.path.join(SAVE_DIR, "merged_fs1_events.png"), dpi=300)
-plt.show()
-
-plt.figure(figsize=(15, 5))
-
-for event_id, df_ev in df_grid_all.groupby("event_id"):
-    plt.plot(
-        df_ev["dist_m"] / DX,
-        df_ev["fs2"],
-        lw=1,
-        alpha=0.4,
-        label=f"fs2 {event_id}"
-    )
-
-plt.plot(
-    x_chan,
-    df_merged["fs2_median"],
-    "k",
-    lw=2.5,
-    label="fs2 median"
-)
-
-plt.fill_between(
-    x_chan,
-    df_merged["fs2_median"] - df_merged["fs2_std"],
-    df_merged["fs2_median"] + df_merged["fs2_std"],
-    alpha=0.2,
-    label="fs2 ± std"
-)
-
-plt.xlabel("DAS channel index")
-plt.ylabel("Frequency [Hz]")
-plt.title("Merged fs2 from multiple earthquakes")
-plt.grid()
-plt.legend()
-plt.tight_layout()
-plt.savefig(os.path.join(SAVE_DIR, "merged_fs2_events.png"), dpi=300)
-plt.show()
-
-plt.figure(figsize=(15, 5))
-
-for event_id, df_ev in df_grid_all.groupby("event_id"):
-    plt.plot(
-        df_ev["dist_m"] / DX,
-        df_ev["H"],
-        lw=1,
-        alpha=0.4,
-        label=f"H {event_id}"
-    )
-
-plt.plot(
-    x_chan,
-    df_merged["H_median"],
-    "k",
-    lw=2.5,
-    label="H median"
-)
-
-plt.fill_between(
-    x_chan,
-    df_merged["H_median"] - df_merged["H_std"],
-    df_merged["H_median"] + df_merged["H_std"],
-    alpha=0.2,
-    label="H ± std"
-)
-
-plt.xlabel("DAS channel index")
-plt.ylabel("Estimated LVL thickness H [m]")
-plt.title("Merged LVL thickness from multiple earthquakes")
-plt.grid()
-plt.legend()
-plt.tight_layout()
-plt.savefig(os.path.join(SAVE_DIR, "merged_H_events.png"), dpi=300)
-plt.show()
+if __name__ == "__main__":
+    main()
