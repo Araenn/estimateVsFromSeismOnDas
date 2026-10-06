@@ -6,6 +6,8 @@ Display and picking functions use shape [frequency, channel].
 """
 
 import numpy as np
+from fractions import Fraction
+from pathlib import Path
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter
 from scipy.signal import butter, resample_poly, sosfiltfilt, welch
@@ -40,9 +42,12 @@ def preprocess_das_matrix(data, chx, fs_in=2000, fs_out=40,
         raise ValueError(f"Cannot identify DAS axes: {data.shape}, {len(chx)} channels")
     if not 0 < fmin < fmax < fs_out / 2:
         raise ValueError("The filter requires 0 < fmin < fmax < fs_out/2.")
-    if int(fs_in) != fs_in or int(fs_out) != fs_out:
-        raise ValueError("fs_in and fs_out must be integers for resample_poly.")
-    data_dec = resample_poly(data_das, int(fs_out), int(fs_in), axis=1)
+    if not np.isfinite(fs_in) or not np.isfinite(fs_out) or fs_in <= 0 or fs_out <= 0:
+        raise ValueError("Sampling rates must be positive and finite.")
+    ratio = Fraction(float(fs_out / fs_in)).limit_denominator(100000)
+    if not np.isclose(float(ratio), fs_out / fs_in, rtol=1e-9, atol=0):
+        raise ValueError("Sampling rate ratio cannot be represented accurately for resampling.")
+    data_dec = resample_poly(data_das, ratio.numerator, ratio.denominator, axis=1)
     sos = butter(4, [fmin, fmax], btype="bandpass", fs=fs_out, output="sos")
     return sosfiltfilt(sos, data_dec, axis=1)
 
@@ -59,21 +64,122 @@ def spectra_from_matrix(data_filt, fs, fmin, fmax, nperseg_s=60,
     return f[keep], psd[:, keep], nperseg, noverlap
 
 
+def select_das_section(metadata, chan_start_idx=None, chan_end_idx=None,
+                       distance_origin_m=0.0, section_start_m=None, section_end_m=None):
+    """Find recorded indices inside fixed physical bounds, relative to a fixed origin.
+
+    Keep only measured positions inside the requested section. If a recording
+    covers only part of the section, retain its true offset rather than moving
+    its first sensor to zero. Index bounds, when provided, further restrict it.
+    """
+    if not np.isfinite(distance_origin_m) or distance_origin_m < 0:
+        raise ValueError("The cable distance origin must be finite and nonnegative.")
+    for value in (section_start_m, section_end_m):
+        if value is not None and (not np.isfinite(value) or value < 0):
+            raise ValueError("Section bounds must be finite, nonnegative distances in metres.")
+    if (section_start_m is not None and section_end_m is not None
+            and section_end_m <= section_start_m):
+        raise ValueError("The section end must be greater than its start.")
+    count = metadata["n_channels"]
+    positions = np.asarray(metadata["dist_m"], dtype=float) - distance_origin_m
+    start = 0 if chan_start_idx is None else chan_start_idx
+    requested_end = count - 1 if chan_end_idx is None else chan_end_idx
+    if int(start) != start or int(requested_end) != requested_end or not 0 <= start < count:
+        raise ValueError(f"Invalid channel selection for a recording with {count} channels.")
+    start, end = int(start), min(int(requested_end), count - 1)
+    if section_start_m is not None:
+        start = max(start, int(np.searchsorted(positions, section_start_m - 1e-6)))
+    if section_end_m is not None:
+        end = min(end, int(np.searchsorted(positions, section_end_m + 1e-6, side="right")) - 1)
+    if end <= start:
+        raise ValueError("The requested section contains fewer than two recorded channels. "
+                         "Check the section bounds and cable origin for this acquisition.")
+    if requested_end >= count:
+        print(f"Channel end reduced from {requested_end} to {count - 1} ({count} recorded channels).")
+    indices = np.arange(start, end + 1)
+    selected_positions = positions[indices].copy()
+    selected_positions[np.abs(selected_positions) < 1e-6] = 0.0
+    return dict(chan_start=start, chan_end=end, chx=indices,
+                dist_m=selected_positions, metadata_dist_m=np.asarray(metadata["dist_m"])[indices],
+                absolute_channels=metadata["absolute_channels"][indices],
+                distance_origin_m=float(distance_origin_m))
+
+
+def resolve_das_acquisition(t_start, t_end, path_folder, chan_start_idx=None,
+                            chan_end_idx=None, fs_out=40, fmin=0.3, fmax=19, *,
+                            distance_origin_m=0.0, section_start_m=None, section_end_m=None):
+    """Resolve sampling and physical geometry from all selected DAS headers."""
+    from sensor_io_func import get_das_files_for_window
+    from simpleDASreader4 import read_DAS_metadata
+
+    folder, file_ids = get_das_files_for_window(t_start, t_end, path_folder)
+    reference = None
+    for file_id in file_ids:
+        filename = Path(folder) / f"{file_id:06d}.hdf5"
+        current = read_DAS_metadata(str(filename))
+        if reference is None:
+            reference = current
+        elif (current["n_channels"] != reference["n_channels"]
+              or not np.isclose(current["fs_in"], reference["fs_in"], rtol=1e-10)
+              or not np.array_equal(current["absolute_channels"], reference["absolute_channels"])
+              or not np.allclose(current["dist_m"], reference["dist_m"], rtol=0, atol=1e-6)):
+            raise ValueError(f"{filename}: acquisition settings change within the event window. "
+                             "Select a window with consistent sampling and channel geometry.")
+    if reference is None:
+        raise ValueError("No DAS files were found in the requested event window.")
+    count = reference["n_channels"]
+    selection = select_das_section(reference, chan_start_idx, chan_end_idx,
+                                   distance_origin_m, section_start_m, section_end_m)
+    if not np.isfinite(fs_out) or fs_out <= 0 or not np.isfinite(fmax) or fmax <= 0:
+        raise ValueError("Processing sampling rate and maximum frequency must be positive and finite.")
+    rate = min(float(fs_out), float(reference["fs_in"]))
+    maximum = min(float(fmax), 0.95 * rate / 2)
+    if not 0 < fmin < maximum:
+        raise ValueError("The recording sampling rate is too low for the requested frequency band.")
+    result = dict(folder=folder, file_ids=file_ids, fs_in=reference["fs_in"],
+                  fs_out=rate, fmin=float(fmin), fmax=maximum, dx=reference["dx"],
+                  header_dx=reference["header_dx"], n_channels=count,
+                  **selection)
+    print(f"DAS metadata: {count} channels; selected recorded indices "
+          f"{result['chan_start']}–{result['chan_end']}; "
+          f"spacing = {result['dx']:.6g} m; input rate = {result['fs_in']:.9g} Hz; "
+          f"processing rate = {rate:.9g} Hz; maximum frequency = {maximum:.6g} Hz.")
+    print(f"Selected metadata channels: {result['absolute_channels'][0]}–"
+          f"{result['absolute_channels'][-1]}; section distances: "
+          f"{result['dist_m'][0] / 1000:.6f}–{result['dist_m'][-1] / 1000:.6f} km "
+          f"({len(result['chx'])} measured channels).")
+    return result
+
+
+def clip_frequency_band(band, frequencies):
+    """Limit a display or picking band to the frequencies actually available."""
+    low, high = max(float(band[0]), frequencies[0]), min(float(band[1]), frequencies[-1])
+    if low >= high or np.count_nonzero((frequencies >= low) & (frequencies <= high)) < 2:
+        raise ValueError(f"Band {band} is unavailable at this recording's sampling rate.")
+    return float(low), float(high)
+
+
 def das_fx_spectrum_chunked(t_start, t_end, chan_start_idx, chan_end_idx,
-                            path_folder, chunk_channels=100, fs_in=2000,
+                            path_folder, chunk_channels=100, fs_in=None,
                             fs_out=40, fmin=0.3, fmax=19.0,
-                            nperseg_s=60, noverlap_s=30, average="mean"):
+                            nperseg_s=60, noverlap_s=30, average="mean", acquisition=None):
     """Load data as in the original project, then compute unnormalized PSDs.
 
     File selection is delegated to sensor_io_func.
     No common-mode removal or time-domain signal stacking is applied.
     """
-    from sensor_io_func import get_das_files_for_window
     from simpleDASreader4 import load_multiple_DAS_files
 
-    if chunk_channels < 1 or chan_end_idx < chan_start_idx:
-        raise ValueError("Invalid channel range or channel chunk size.")
-    folder, idfiles = get_das_files_for_window(t_start, t_end, path_folder)
+    if int(chunk_channels) != chunk_channels or chunk_channels < 1:
+        raise ValueError("Channel chunk size must be a positive integer.")
+    acquisition = acquisition or resolve_das_acquisition(
+        t_start, t_end, path_folder, chan_start_idx, chan_end_idx, fs_out, fmin, fmax)
+    if fs_in is not None and not np.isclose(fs_in, acquisition["fs_in"], rtol=1e-9):
+        raise ValueError("FS_IN disagrees with the sampling rate recorded in the DAS metadata.")
+    folder, idfiles = acquisition["folder"], acquisition["file_ids"]
+    chan_start_idx, chan_end_idx = acquisition["chan_start"], acquisition["chan_end"]
+    fs_in, fs_out = acquisition["fs_in"], acquisition["fs_out"]
+    fmin, fmax = acquisition["fmin"], acquisition["fmax"]
     parts, channels = [], []
     f_ref, duration_ref, params_ref = None, None, None
     for ch0 in range(chan_start_idx, chan_end_idx + 1, chunk_channels):
@@ -96,7 +202,11 @@ def das_fx_spectrum_chunked(t_start, t_end, chan_start_idx, chan_end_idx,
         del data, filtered
     return dict(chx=np.concatenate(channels), freqs=f_ref,
                 psd=np.vstack(parts), fs=fs_out, duration_s=duration_ref,
-                nperseg=params_ref[0], noverlap=params_ref[1])
+                nperseg=params_ref[0], noverlap=params_ref[1],
+                dist_m=acquisition["dist_m"], dx=acquisition["dx"], fs_in=fs_in,
+                absolute_channels=acquisition["absolute_channels"],
+                metadata_dist_m=acquisition["metadata_dist_m"],
+                distance_origin_m=acquisition["distance_origin_m"])
 
 
 def extract_fx_arrays(res_fx, dx=4.08):
@@ -108,7 +218,7 @@ def extract_fx_arrays(res_fx, dx=4.08):
         raise ValueError("Cached PSD dimensions do not match the frequency and channel axes.")
     with np.errstate(invalid="ignore", divide="ignore"):
         Z = 10 * np.log10(np.maximum(psd, 1e-30)).T
-    return f, chx * dx, Z
+    return f, np.asarray(res_fx.get("dist_m", chx * dx), dtype=float), Z
 
 
 def prepare_display(Z_db, f, normalize_band=(0.5, 9.0),
@@ -153,7 +263,7 @@ def color_limits(Z, f, band, percentiles=(5, 95)):
 
 
 def plot_comparison(raw, smooth, f, x_chan, band=(0.5, 9.0),
-                    percentiles=(5, 95), title="", save_path=None):
+                    percentiles=(5, 95), title="", save_path=None, x_label="DAS channel"):
     """Show two views with identical color limits and no pick overlays."""
     lo, hi = color_limits(raw, f, band, percentiles)
     keep = (f >= band[0]) & (f <= band[1])
@@ -166,7 +276,7 @@ def plot_comparison(raw, smooth, f, x_chan, band=(0.5, 9.0),
         ax.set_ylabel("Frequency [Hz]")
         ax.set_ylim(*band)
         ax.set_xlim(x_chan[0], x_chan[-1])
-    axes[-1].set_xlabel("DAS channel")
+    axes[-1].set_xlabel(x_label)
     fig.suptitle(title)
     fig.colorbar(im, ax=axes, label="Relative PSD [dB / channel median]")
     if save_path:
@@ -204,7 +314,7 @@ def interpolate_manual_picks(x_picks, f_picks, x_target,
         out[inside] = np.interp(target[inside], x, f)
         if max_gap_channels is not None:
             for a, b in zip(x[:-1], x[1:]):
-                if b - a > max_gap_channels:
+                if b - a > max_gap_channels * (1 + 1e-12):
                     out[(target > a) & (target < b)] = np.nan
     for xx, ff in zip(x, f):
         out[np.isclose(target, xx, rtol=0, atol=1e-9)] = ff
@@ -213,12 +323,14 @@ def interpolate_manual_picks(x_picks, f_picks, x_target,
 
 def manual_pick_curve(raw, smooth, f, x_chan, title="fs1", band=(0.5, 4.0),
                        segment_channels=1000, percentiles=(5, 95),
-                       initial_picks=None, on_update=None):
+                       initial_picks=None, on_update=None, x_label="DAS channel",
+                       position_label="channels"):
     """Matplotlib picker with adjustable contrast, local spectra and immediate saving.
 
     Left click: add. Shift+left click: inspect only. Right click: remove the
     nearest visible pick. Enter: next segment. Close the window: interrupt.
     Save callbacks receive all picks, including those outside the current view.
+    Segment widths and pick coordinates use the units of x_chan.
     """
     from matplotlib.widgets import RangeSlider, RadioButtons, Button
 
@@ -255,11 +367,11 @@ def manual_pick_curve(raw, smooth, f, x_chan, title="fs1", band=(0.5, 4.0),
         im = ax.pcolormesh(x_chan[spatial], f[keep],
                           np.ma.masked_invalid(smooth[np.ix_(keep, spatial)]),
                           shading="nearest", cmap="viridis", vmin=lo, vmax=hi)
-        ax.set(xlim=(start, end), ylim=band, xlabel="DAS channel",
+        ax.set(xlim=(start, end), ylim=band, xlabel=x_label,
                ylabel="Frequency [Hz]")
         points, = ax.plot([], [], "o", color="white", mec="black", ms=5)
-        spec_ax.set(xlabel="Relative PSD [dB]", title="Click a channel")
-        fig.suptitle(f"{title} | channels {start:g}–{end:g}")
+        spec_ax.set(xlabel="Relative PSD [dB]", title="Click a position")
+        fig.suptitle(f"{title} | {position_label} {start:g}–{end:g}")
         fig.text(0.07, 0.02,
                  "Left: add | Shift+left: inspect spectrum | "
                  "Right: remove | Enter: next | Close: interrupt",
@@ -289,7 +401,7 @@ def manual_pick_curve(raw, smooth, f, x_chan, title="fs1", band=(0.5, 4.0),
                          label="No smoothing")
             spec_ax.plot(smooth[keep, ix], f[keep], color="tab:blue", lw=1,
                          label="Light smoothing")
-            spec_ax.set(xlabel="Relative PSD [dB]", title=f"Channel {x_chan[ix]:g}")
+            spec_ax.set(xlabel="Relative PSD [dB]", title=f"{position_label}: {x_chan[ix]:g}")
             spec_ax.set_ylim(*band)
             spec_ax.legend(fontsize=8)
             spec_ax.grid(alpha=0.15)
@@ -437,8 +549,9 @@ def plot_resonance_model(dist_m, cs0, nu, H, dx=4.08, title="",
         if water_depth_m.shape != dist_m.shape:
             raise ValueError("water_depth_m must have shape [channel], matching dist_m.")
         parameters.append(water_depth_m)
-    channels = np.rint(dist_m / dx).astype(int)
-    if not np.allclose(dist_m, channels * dx, rtol=0, atol=1e-6):
+    origin = dist_m[0]
+    channels = np.rint((dist_m - origin) / dx).astype(int)
+    if not np.allclose(dist_m, origin + channels * dx, rtol=0, atol=1e-6):
         raise ValueError("Model distances must align with the DAS channel spacing.")
     n_channels = channels[-1] - channels[0] + 1
     full_parameters = []
@@ -460,8 +573,8 @@ def plot_resonance_model(dist_m, cs0, nu, H, dx=4.08, title="",
     section = vs_power_law(z[:, None], cs0[None, :], nu[None, :])
     section = np.where(valid[None, :] & (z[:, None] <= H[None, :]), section, np.nan)
     centers = [np.where(valid, value, np.nan) for value in (H, cs0, nu)]
-    x_km = np.arange(channels[0], channels[-1] + 1) * dx / 1000
-    x_edges = (np.arange(channels[0], channels[-1] + 2) - 0.5) * dx / 1000
+    x_km = (origin + np.arange(channels[0], channels[-1] + 1) * dx) / 1000
+    x_edges = (origin + (np.arange(channels[0], channels[-1] + 2) - 0.5) * dx) / 1000
     z_edges = np.r_[0, (z[:-1] + z[1:]) / 2, depth_max_m]
     cmap = plt.get_cmap("turbo").copy()
     cmap.set_bad("white")

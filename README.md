@@ -21,7 +21,7 @@ Install the Python dependencies:
 python -m pip install numpy scipy pandas matplotlib xarray pyproj netCDF4 h5py PySide6
 ```
 
-Also provide **ASN's `h5pydict` module** on Python's import path. `espg3996tomercator.py` is an optional raster utility requiring `rasterio`; the pipeline does not use it.
+Also provide **ASN's `h5pydict` module** on Python's import path.
 
 Picking requires a graphical display and an interactive Matplotlib backend (QtAgg or TkAgg).
 

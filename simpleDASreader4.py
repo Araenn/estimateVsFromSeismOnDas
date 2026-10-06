@@ -79,6 +79,47 @@ def _integrated_unit(unit):
     return unit[:-2] if unit.endswith("/s") else f"({unit})*s"
 
 
+def read_DAS_metadata(filename):
+    """Read acquisition geometry and sampling rate without loading the signal."""
+    import h5pydict
+
+    with h5pydict.DictFile(filename, "r") as stream:
+        meta = stream.load_dict(skipFields=["data"])
+        _fix_meta(meta)
+        shape = stream["data"].shape
+    if len(shape) != 2:
+        raise ValueError(f"{filename}: expected data with shape [time, channel].")
+    header = meta["header"]
+    dt, base_dx = float(header["dt"]), float(header["dx"])
+    if not np.isfinite(dt) or dt <= 0 or not np.isfinite(base_dx) or base_dx <= 0:
+        raise ValueError(f"{filename}: metadata dt and dx must be positive and finite.")
+    channels = np.asarray(header["channels"], dtype=float)
+    if (channels.shape != (shape[1],) or not np.all(np.isfinite(channels))
+            or not np.all(np.diff(channels) > 0)):
+        raise ValueError(f"{filename}: header channels do not match the recorded data columns.")
+    positions = meta.get("cableSpec", {}).get("sensorDistances")
+    distances = (channels * base_dx if positions is None
+                 else np.asarray(positions, dtype=float))
+    if (distances.shape != channels.shape or not np.all(np.isfinite(distances))
+            or np.any(distances < 0) or not np.all(np.diff(distances) > 0)):
+        raise ValueError(f"{filename}: invalid sensor distances in the DAS metadata.")
+    if len(distances) > 1:
+        spacing = (base_dx * float(np.min(np.diff(channels)))
+                   if np.allclose(distances, channels * base_dx, rtol=0, atol=1e-6)
+                   else float(np.round(np.min(np.diff(distances)), 9)))
+    else:
+        spacing = base_dx
+    if not np.allclose((distances - distances[0]) / spacing,
+                       np.rint((distances - distances[0]) / spacing), atol=1e-6, rtol=0):
+        raise ValueError(f"{filename}: sensor positions do not lie on a regular spatial grid.")
+    fs = 1.0 / dt
+    if np.isclose(fs, round(fs), rtol=0, atol=1e-7):
+        fs = int(round(fs))
+    return dict(fs_in=fs, dx=spacing, header_dx=base_dx,
+                n_channels=int(shape[1]), absolute_channels=channels,
+                dist_m=distances, n_samples=int(shape[0]))
+
+
 def load_DAS_file(filename, chIndex=None, roiIndex=None, samples=None,
                   integrate=True, unwr=True, metaDetail=1, useSensitivity=True,
                   spikeThr=None):

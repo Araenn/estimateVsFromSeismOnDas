@@ -31,6 +31,31 @@ def distance_from_latlon_to_meters(lat1, lon1, lat2, lon2):
     return earth_radius_m * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
 
 
+def interpolate_cable_coordinates(filepath, distances_m, allow_outside=False):
+    """Sample mapped cable coordinates at section distances in metres.
+
+    With allow_outside=True, return NaN beyond the mapped cable endpoint.
+    """
+    distances = np.asarray(distances_m, dtype=float)
+    if distances.ndim != 1 or not np.all(np.isfinite(distances)) or np.any(distances < 0):
+        raise ValueError("Cable sampling distances must be finite, nonnegative and one-dimensional.")
+    latitudes, longitudes = read_coordinates(filepath)
+    lengths = [distance_from_latlon_to_meters(latitudes[i], longitudes[i],
+                                              latitudes[i + 1], longitudes[i + 1])
+               for i in range(len(latitudes) - 1)]
+    positions = np.r_[0.0, np.cumsum(lengths)]
+    unique = np.r_[True, np.diff(positions) > 0]
+    outside = distances > positions[-1]
+    if np.any(outside) and not allow_outside:
+        raise ValueError("The cable geometry is shorter than the distances requested by the DAS metadata.")
+    # No extrapolation beyond the mapped cable: keep unavailable bathymetry missing.
+    latitude = np.interp(distances, positions[unique], np.asarray(latitudes)[unique])
+    longitude = np.interp(distances, positions[unique], np.asarray(longitudes)[unique])
+    latitude[outside] = np.nan
+    longitude[outside] = np.nan
+    return latitude, longitude
+
+
 def create_cable_map(filepath, channel_numbers, interval, start_offset_m=0):
     """Interpolate coordinates at evenly spaced distances along the cable.
 
