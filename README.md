@@ -6,7 +6,7 @@ Earthquakes times are picked based on the https://www.jordskjelv.no/ database.
 
 ## Setup
 
-Keep the scripts together, using the filenames below without download suffixes such as `(2)`.
+Keep the scripts together, using the filenames below.
 
 | File | Purpose |
 | --- | --- |

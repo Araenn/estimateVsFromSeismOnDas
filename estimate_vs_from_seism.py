@@ -24,8 +24,10 @@ T_END = [14, 15, 42] """
 T_END = [12, 40, 42] """
 T_START = [19, 40, 42] # 1509
 T_END = [19, 55, 42]
-""" T_START = [17, 18, 42] # 12
-T_END = [17, 28, 42] """
+T_START = [17, 18, 42] # 12
+T_END = [17, 28, 42]
+T_START = [19, 35, 42] # 12
+T_END = [19, 45, 42]
 # Fixed physical reference from the original metadata: channels 5000 to 25004.
 # These are section coordinates, independent of each recording's channel grid.
 CABLE_ORIGIN_M = 5000 * 1.0213001907746815
@@ -33,7 +35,7 @@ SECTION_START_M, SECTION_END_M = 0.0, 20004 * 1.0213001907746815
 CHAN_START, CHAN_END = None, None   # optional recorded-index restrictions within the section
 DX = None                          # read effective spatial spacing from metadata
 FS_IN, FS_OUT = None, 40            # metadata input rate; desired processing rate
-FMIN, FMAX = 0.3, 19.0              # requested band; FMAX is capped below Nyquist
+FMIN, FMAX = 0.3, FS_OUT//2-1              # requested band; FMAX is capped below Nyquist
 NPERSEG_S, NOVERLAP_S = 60, 30
 CHUNK_CHANNELS = 100
 WELCH_AVERAGE = "mean"
