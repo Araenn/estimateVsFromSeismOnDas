@@ -13,9 +13,9 @@ import vs_functions as func
 
 
 # =========================== PARAMETERS ============================
-SAVE_DIR = "/home/lea/Desktop/code/resonance_model/resonance_model/picking"
-DAS_FOLDER = "/media/lea/Expansion/DAS/20250820/dphi"
-EVENT_ID = "2008"                    # day/event label; time bounds are added automatically
+SAVE_DIR = "/home/lea/Desktop/code/resonance_model/resonance_model/picking_longcable"
+DAS_FOLDER = "/media/lea/Expansion/20250905/dphi"
+EVENT_ID = "0509"                    # day/event label; time bounds are added automatically
 """ T_START = [4, 54, 42] # 16
 T_END = [5, 4, 42]
 T_START = [14, 0, 42] # 1508
@@ -26,12 +26,13 @@ T_START = [19, 40, 42] # 1509
 T_END = [19, 55, 42]
 T_START = [17, 18, 42] # 12
 T_END = [17, 28, 42]
-T_START = [19, 35, 42] # 12
-T_END = [19, 45, 42]
+T_START = [17, 40, 42] # 12
+T_END = [17, 50, 42]
 # Fixed physical reference from the original metadata: channels 5000 to 25004.
 # These are section coordinates, independent of each recording's channel grid.
 CABLE_ORIGIN_M = 5000 * 1.0213001907746815
-SECTION_START_M, SECTION_END_M = 0.0, 20004 * 1.0213001907746815
+SECTION_START_M = 0.0
+MAX_DISTANCE_KM = None             # section distance shown on plots; e.g. 20.0; None: all available
 CHAN_START, CHAN_END = None, None   # optional recorded-index restrictions within the section
 DX = None                          # read effective spatial spacing from metadata
 FS_IN, FS_OUT = None, 40            # metadata input rate; desired processing rate
@@ -43,7 +44,7 @@ WELCH_AVERAGE = "mean"
 NORMALIZE_BAND = (0.5, FMAX//2)
 PREVIEW_BAND = (0.5, FMAX//2)
 FS1_PICK_BAND = (0.5, 4.0)          # display bands; no model constraint is imposed
-FS2_PICK_BAND = (2.0, FMAX//2)
+FS2_PICK_BAND = (0.5, FMAX//2)
 SPATIAL_SIGMA_CHANNELS = 3.0         # physical smoothing width depends on metadata spacing
 FREQ_SIGMA_HZ = 0.0                 # no frequency smoothing
 COLOR_PERCENTILES = (5, 95)
@@ -100,10 +101,11 @@ def analysis_identity(event_id=None, t_start=None, t_end=None):
 
 
 def resolve_acquisition():
+    section_end_m = None if MAX_DISTANCE_KM is None else MAX_DISTANCE_KM * 1000.0
     acquisition = func.resolve_das_acquisition(
         T_START, T_END, DAS_FOLDER, CHAN_START, CHAN_END, FS_OUT, FMIN, FMAX,
         distance_origin_m=CABLE_ORIGIN_M,
-        section_start_m=SECTION_START_M, section_end_m=SECTION_END_M)
+        section_start_m=SECTION_START_M, section_end_m=section_end_m)
     for name, requested, detected in (("FS_IN", FS_IN, acquisition["fs_in"]),
                                       ("DX", DX, acquisition["dx"])):
         if requested is not None and not np.isclose(requested, detected, rtol=1e-9):
@@ -228,8 +230,11 @@ def main():
                     model_reverse_distance=MODEL_REVERSE_DISTANCE,
                     model_vs_limits=MODEL_VS_LIMITS,
                     metadata_channel_count=acquisition["n_channels"],
+                    max_distance_km=MAX_DISTANCE_KM,
+                    selected_channel_count=len(acquisition["chx"]),
                     metadata_header_dx=acquisition["header_dx"],
-                    section_start_m=SECTION_START_M, section_end_m=SECTION_END_M,
+                    section_start_m=SECTION_START_M,
+                    section_end_m=None if MAX_DISTANCE_KM is None else MAX_DISTANCE_KM * 1000.0,
                     selected_metadata_channel_start=int(acquisition["absolute_channels"][0]),
                     selected_metadata_channel_end=int(acquisition["absolute_channels"][-1]))
     (out / f"settings_{analysis_id}.json").write_text(
